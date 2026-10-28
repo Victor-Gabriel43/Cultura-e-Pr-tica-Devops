@@ -1,1 +1,1 @@
-# Cultura-e-Pr-tica-Devops
+# Cultura e Prática DevOps
