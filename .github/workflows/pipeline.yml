@@ -1,0 +1,233 @@
+name: Pipeline CI/CD
+
+on:
+  push:
+    branches: [main, develop, 'feature/**', 'release/**', 'hotfix/**']
+  pull_request:
+    branches: [main, develop]
+
+# Limites aceitos pelas validações de segurança (0 = nenhum achado tolerado)
+env:
+  LIMITE_SAST_ERROR: 0
+  LIMITE_DAST_ALTO: 0
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Gerar pasta de publicação
+        run: |
+          mkdir -p public
+          cp index.html public/
+          ls -l public
+
+      - name: Guardar build
+        uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: public
+
+  test:
+    name: Testes
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperar build
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: public
+
+      - name: Verificar se o index.html existe
+        run: test -f public/index.html
+
+      - name: Validar HTML com htmlhint
+        run: npx --yes htmlhint@1 public/index.html
+
+  # ---------------------------------------------------------------
+  # Nó SAST - Static Application Security Testing
+  # Analisa o código-fonte parado, sem executar a aplicação.
+  # ---------------------------------------------------------------
+  sast:
+    name: Segurança - SAST
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar o Semgrep
+        run: pipx install semgrep
+
+      - name: Rodar o Semgrep (OWASP Top 10 + segredos)
+        run: |
+          semgrep scan \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --metrics=off \
+            --json --output sast-resultado.json \
+            --sarif-output sast-resultado.sarif \
+            .
+
+      - name: Enviar resultado para a aba Security do GitHub
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sast-resultado.sarif
+          category: semgrep
+
+      - name: Guardar relatório do SAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-sast
+          path: sast-resultado.*
+
+      - name: Validação do SAST
+        run: |
+          total=$(jq '.results | length' sast-resultado.json)
+          error=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' sast-resultado.json)
+          warning=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' sast-resultado.json)
+          falhas_execucao=$(jq '.errors | length' sast-resultado.json)
+
+          {
+            echo "### Resultado do SAST (Semgrep)"
+            echo "| Severidade | Quantidade |"
+            echo "|---|---|"
+            echo "| ERROR | $error |"
+            echo "| WARNING | $warning |"
+            echo "| Total | $total |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$falhas_execucao" -gt 0 ]; then
+            echo "::error::Semgrep teve $falhas_execucao falha(s) ao analisar o código"
+            exit 1
+          fi
+          if [ "$error" -gt "$LIMITE_SAST_ERROR" ]; then
+            jq -r '.results[] | select(.extra.severity == "ERROR") | "::error file=\(.path),line=\(.start.line)::\(.check_id)"' sast-resultado.json
+            echo "::error::SAST reprovado: $error achado(s) ERROR (limite: $LIMITE_SAST_ERROR)"
+            exit 1
+          fi
+          echo "SAST aprovado: $error ERROR, $warning WARNING"
+
+  # ---------------------------------------------------------------
+  # Nó DAST - Dynamic Application Security Testing
+  # Coloca a aplicação no ar e ataca ela de fora, como um usuário.
+  # ---------------------------------------------------------------
+  dast:
+    name: Segurança - DAST
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: Recuperar build
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: public
+
+      - name: Colocar a aplicação no ar com Nginx
+        run: |
+          docker run -d --name app -p 8080:80 \
+            -v "$PWD/public:/usr/share/nginx/html:ro" nginx:alpine
+          timeout 30 bash -c 'until curl -sf http://localhost:8080/ > /dev/null; do sleep 1; done'
+          echo "Aplicação respondendo em http://localhost:8080"
+
+      - name: Rodar o OWASP ZAP (baseline scan)
+        run: |
+          mkdir -p dast && chmod 777 dast
+          cp .zap/rules.tsv dast/
+          set +e
+          docker run --rm --network host -v "$PWD/dast:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://localhost:8080 \
+            -c rules.tsv \
+            -J dast-resultado.json \
+            -r dast-resultado.html \
+            -I
+          echo "CODIGO_ZAP=$?" >> "$GITHUB_ENV"
+
+      - name: Guardar relatório do DAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-dast
+          path: dast/dast-resultado.*
+
+      - name: Validação do DAST
+        run: |
+          relatorio=dast/dast-resultado.json
+          if [ ! -s "$relatorio" ]; then
+            echo "::error::ZAP não gerou relatório (código de saída $CODIGO_ZAP)"
+            exit 1
+          fi
+
+          alto=$(jq '[.site[].alerts[] | select((.riskcode | tonumber) == 3)] | length' "$relatorio")
+          medio=$(jq '[.site[].alerts[] | select((.riskcode | tonumber) == 2)] | length' "$relatorio")
+          baixo=$(jq '[.site[].alerts[] | select((.riskcode | tonumber) <= 1)] | length' "$relatorio")
+
+          {
+            echo "### Resultado do DAST (OWASP ZAP)"
+            echo "| Risco | Quantidade |"
+            echo "|---|---|"
+            echo "| Alto | $alto |"
+            echo "| Médio | $medio |"
+            echo "| Baixo/Info | $baixo |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Código 1 = alguma regra marcada como FAIL no .zap/rules.tsv disparou
+          if [ "$CODIGO_ZAP" = "1" ]; then
+            echo "::error::DAST reprovado: regra FAIL do .zap/rules.tsv disparou (XSS / SQL Injection)"
+            exit 1
+          fi
+          # Código 3 = o ZAP não conseguiu terminar a varredura
+          if [ "$CODIGO_ZAP" = "3" ]; then
+            echo "::error::ZAP falhou durante a varredura"
+            exit 1
+          fi
+          if [ "$alto" -gt "$LIMITE_DAST_ALTO" ]; then
+            echo "::error::DAST reprovado: $alto alerta(s) de risco alto (limite: $LIMITE_DAST_ALTO)"
+            exit 1
+          fi
+          echo "DAST aprovado: $alto alto, $medio médio, $baixo baixo/info"
+
+      - name: Derrubar a aplicação
+        if: always()
+        run: docker rm -f app || true
+
+  deploy:
+    name: Deploy
+    needs: dast
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publicar.outputs.page_url }}
+    steps:
+      - name: Recuperar build
+        uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: public
+
+      - name: Preparar artefato do Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Publicar no GitHub Pages
+        id: publicar
+        uses: actions/deploy-pages@v4
